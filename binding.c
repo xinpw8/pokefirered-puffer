@@ -27,7 +27,7 @@
 #define NUM_ATNS   1
 #define ACT_SIZES  {PFR_NUM_ACTIONS}  /* {8} */
 #define OBS_TYPE   UNSIGNED_CHAR
-#define ACT_TYPE   FLOAT
+#define ACT_TYPE   INT
 
 #define Env  PfrEnv
 #define Log  PfrLog
@@ -90,6 +90,10 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
             env->savestate_path[sizeof(env->savestate_path) - 1] = 0;
         }
     }
+
+    /* use_pixels kwarg (0 = lite mode, skip pixel extraction) */
+    PyObject *pix_obj = PyDict_GetItemString(kwargs, "use_pixels");
+    env->use_pixels = (pix_obj && PyLong_AsLong(pix_obj)) ? 1 : 0;
 
     /* Assign game instance from pre-created pool */
     int env_id = sNextEnvId++;

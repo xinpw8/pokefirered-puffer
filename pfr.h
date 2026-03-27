@@ -207,7 +207,7 @@ struct PfrEnv {
     PfrLog log;                        /* MUST be first (env_binding.h) */
 
     unsigned char *observations;       /* PufferLib-managed buffer */
-    float         *actions;            /* PufferLib-managed buffer (float32) */
+    int           *actions;            /* PufferLib-managed buffer (float32) */
     float         *rewards;            /* PufferLib-managed buffer */
     unsigned char *terminals;          /* PufferLib-managed buffer */
 
@@ -217,6 +217,7 @@ struct PfrEnv {
     uint32_t max_steps;
     uint32_t frames_per_step;
     char     savestate_path[512];
+    uint8_t  use_pixels;             /* skip pfr_extract_pixels when 0 */
 };
 
 /* ================================================================
@@ -391,7 +392,8 @@ static void pfr_restore_episode(PfrEnv *env, bool clear_outputs) {
     /* 4. Extract observations (scalars + NPCs from game, visited + pixels from us) */
     inst->extract_obs(env->observations);  /* fills [0..144] */
     pfr_extract_visited_tiles(env);         /* fills [145..272] */
-    pfr_extract_pixels(env);                /* fills [273..115472] */
+    if (env->use_pixels)
+        pfr_extract_pixels(env);            /* fills [273..115472] */
 
     if (clear_outputs) {
         env->rewards[0] = 0.0f;
@@ -439,7 +441,8 @@ static void c_step(PfrEnv *env) {
     /* 3. Extract observations */
     inst->extract_obs(env->observations);   /* scalars + NPCs [0..144] */
     pfr_extract_visited_tiles(env);          /* visited tiles [145..272] */
-    pfr_extract_pixels(env);                 /* pixels [273..115472] */
+    if (env->use_pixels)
+        pfr_extract_pixels(env);             /* pixels [273..115472] */
 
     /* 4. Compute reward */
     PfrRewardInfo info;

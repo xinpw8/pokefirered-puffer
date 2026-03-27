@@ -2,55 +2,125 @@
 """
 pokefirered_puffer -- PufferLib 4.0 training for Pokemon FireRed (native C)
 
-Uses PFRN (native vectorized PufferEnv) + PFRNPolicy/PFRNLSTM with the
-real PufferLib PuffeRL training runner. No PyBoy, no train_quick.py.
+Primary metric: exploration heatmap (unique tiles visited globally).
+Records: heatmap progression GIF, agent view GIF.
 
 Usage:
-    python train.py                          # train with defaults
-    python train.py --num-envs 16            # 16 parallel envs
-    python train.py --wandb                  # enable wandb logging
-    python train.py --device cpu             # CPU-only training
-    python train.py --load-model-path X.pt   # resume from checkpoint
+    python train.py                              # train with defaults (lite, 32 envs)
+    python train.py --num-envs 64                # more parallelism
+    python train.py --use-pixels                 # full CNN mode (slower)
+    python train.py --wandb                      # enable wandb logging
+    python train.py --load-model-path X.pt       # resume from checkpoint
 """
 
 import argparse
+import json
 import os
 import sys
 import time
 
-# pokefirered-native is a sibling directory -- add it to the import path
+# Ensure local dir takes priority for imports (pfr_policy.py, binding.so)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+# pokefirered-native is a sibling directory
 PFRN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         '..', 'pokefirered-native')
 PFRN_DIR = os.path.normpath(PFRN_DIR)
 if PFRN_DIR not in sys.path:
-    sys.path.insert(0, PFRN_DIR)
+    sys.path.append(PFRN_DIR)
+
+# Use development pufferlib (has WandbLogger, full PuffeRL API)
+PUFFERLIB_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, '..', 'pufferlib'))
+if os.path.isdir(PUFFERLIB_DIR) and PUFFERLIB_DIR not in sys.path:
+    sys.path.insert(1, PUFFERLIB_DIR)
 
 import numpy as np
 import torch
-# torch.distributed MUST be imported before dlopen-based SO-copy instances
-# are created. It initializes internal state in libtorch that prevents the
-# dlopen'd game SOs from corrupting the process during vec_step/vec_reset.
-import torch.distributed  # noqa: F401
+import torch.distributed  # noqa: F401  -- must import before dlopen SO copies
 
 import pufferlib
 import pufferlib.vector
 import pufferlib.pytorch
 from pufferlib.pufferl import PuffeRL, WandbLogger, NoLogger
 
-from pfrn import PFRN, binding, OBS_SIZE, NUM_ACTIONS
-from pfrn_policy import PFRNPolicy, PFRNLSTM
+import binding
+from pfr_policy import PFRNPolicy, PFRNLSTM, OBS_SIZE, NUM_ACTIONS
 
+# Map data for heatmap
+MAP_DATA_PATH = os.path.join(PFRN_DIR, 'pfr_map_data.json')
+
+# Shared state between env and main loop (numpy arrays are by-reference)
+_shared = {}
+
+
+# ── Map utilities ──────────────────────────────────────────────
+
+def load_map_data():
+    with open(MAP_DATA_PATH, 'r') as f:
+        data = json.load(f)
+    global_shape = tuple(data['global_map_shape'])
+    regions = {r['id']: r for r in data['regions'] if r['id'] >= 0}
+    pad = 20
+    padded_shape = (global_shape[0] + pad * 2, global_shape[1] + pad * 2)
+    return regions, padded_shape, pad
+
+
+def local_to_global(y, x, map_group, map_num, regions, pad):
+    map_id = map_group * 256 + map_num
+    region = regions.get(map_id)
+    if region is None:
+        return -1, -1
+    gx = x + region['coordinates'][0] + pad
+    gy = y + region['coordinates'][1] + pad
+    return gy, gx
+
+
+# ── GIF utilities ──────────────────────────────────────────────
+
+def heatmap_to_rgb(heatmap):
+    if heatmap.max() > 0:
+        norm = (heatmap / heatmap.max() * 255).astype(np.uint8)
+    else:
+        norm = np.zeros_like(heatmap, dtype=np.uint8)
+    h, w = norm.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb[..., 1] = norm
+    rgb[..., 2] = (norm.astype(np.float32) * 0.3).astype(np.uint8)
+    return rgb
+
+
+def framebuf_to_rgb(argb_array):
+    """(H,W,4) BGRA uint8 from capture_frame -> (H,W,3) RGB."""
+    return argb_array[:, :, [2, 1, 0]].copy()
+
+
+def save_gif(frames, path, duration=100):
+    from PIL import Image
+    if not frames:
+        return
+    images = [Image.fromarray(f) for f in frames]
+    images[0].save(path, save_all=True, append_images=images[1:],
+                   duration=duration, loop=0)
+
+
+def save_png(rgb, path):
+    from PIL import Image
+    Image.fromarray(rgb).save(path)
+
+
+# ── Training Environment ──────────────────────────────────────
 
 class PFRNTraining(pufferlib.PufferEnv):
-    """Minimal PufferEnv for training that uses the PFRN C binding directly.
+    """PufferEnv for training with built-in heatmap tracking.
 
-    Avoids the explore_map and .copy() overhead from the base PFRN class.
-    The dlmopen'd SO copies conflict with pufferl's ~200 extension modules
-    in the Python _update_explore_map path, so we skip all of that here.
+    Uses PFRN C binding directly. Tracks exploration heatmap across
+    all envs and episodes for monitoring.
     """
 
     def __init__(self, num_envs=1, frames_per_step=4, max_steps=24576,
-                 log_interval=128, seed=0, **kwargs):
+                 log_interval=128, seed=0, use_pixels=0, **kwargs):
         import gymnasium
         self.num_agents = num_envs
         self.single_observation_space = gymnasium.spaces.Box(
@@ -59,11 +129,11 @@ class PFRNTraining(pufferlib.PufferEnv):
         super().__init__()
 
         self._log_interval = log_interval
+        self._use_pixels = use_pixels
         os.makedirs('/tmp/pfrn_instances', exist_ok=True)
         so_path = os.path.join(PFRN_DIR, 'build', 'libpfr_game.so')
-        tmp_dir = '/tmp/pfrn_instances'
 
-        binding.init_instances(so_path, tmp_dir, num_envs)
+        binding.init_instances(so_path, '/tmp/pfrn_instances', num_envs)
         self.c_envs = binding.vec_init(
             self.observations, self.actions, self.rewards,
             self.terminals, self.truncations,
@@ -71,12 +141,20 @@ class PFRNTraining(pufferlib.PufferEnv):
             frames_per_step=frames_per_step,
             max_steps=max_steps,
             savestate_path='',
+            use_pixels=use_pixels,
         )
         self._tick = 0
+
+        # Heatmap tracking
+        self._regions, self._padded_shape, self._pad = load_map_data()
+        self._heatmap = np.zeros(self._padded_shape, dtype=np.float32)
+        _shared['heatmap'] = self._heatmap
+        _shared['padded_shape'] = self._padded_shape
 
     def reset(self, seed=0):
         self.rewards.fill(0)
         binding.vec_reset(self.c_envs, seed)
+        self._update_heatmap()
         return self.observations, [{}]
 
     def step(self, actions):
@@ -84,8 +162,27 @@ class PFRNTraining(pufferlib.PufferEnv):
         self.actions[:] = actions
         binding.vec_step(self.c_envs)
         self._tick += 1
-        log = binding.vec_log(self.c_envs) if self._tick % self._log_interval == 0 else {}
+
+        # Update heatmap (lightweight: 6 bytes per env)
+        self._update_heatmap()
+
+        log = {}
+        if self._tick % self._log_interval == 0:
+            log = binding.vec_log(self.c_envs)
+            log['heatmap_tiles'] = int(np.count_nonzero(self._heatmap))
+
         return self.observations, self.rewards, self.terminals, self.truncations, [log]
+
+    def _update_heatmap(self):
+        for i in range(self.num_agents):
+            obs = self.observations[i]
+            px = int(np.frombuffer(obs[0:2], dtype=np.int16)[0])
+            py = int(np.frombuffer(obs[2:4], dtype=np.int16)[0])
+            mg, mn = int(obs[4]), int(obs[5])
+            gy, gx = local_to_global(py, px, mg, mn,
+                                     self._regions, self._pad)
+            if gy >= 0 and gx >= 0:
+                self._heatmap[gy, gx] += 1.0
 
     def render(self):
         pass
@@ -95,34 +192,31 @@ class PFRNTraining(pufferlib.PufferEnv):
         binding.destroy_instances()
 
 
+# ── Args ──────────────────────────────────────────────────────
+
 def parse_args():
-    p = argparse.ArgumentParser(description='PufferLib training for Pokemon FireRed (native)')
+    p = argparse.ArgumentParser(
+        description='PufferLib training for Pokemon FireRed (native)')
 
     # Environment
-    p.add_argument('--num-envs', type=int, default=8,
-                   help='Number of parallel game instances (vectorized in C)')
-    p.add_argument('--frames-per-step', type=int, default=4,
-                   help='GBA frames per RL step')
-    p.add_argument('--max-steps', type=int, default=24576,
-                   help='Max steps per episode before truncation')
-    p.add_argument('--log-interval', type=int, default=128,
-                   help='Steps between env-level stat logging')
+    p.add_argument('--num-envs', type=int, default=32,
+                   help='Parallel game instances (default: 32 for high SPS)')
+    p.add_argument('--frames-per-step', type=int, default=4)
+    p.add_argument('--max-steps', type=int, default=24576)
+    p.add_argument('--log-interval', type=int, default=128)
+    p.add_argument('--use-pixels', action='store_true', default=False,
+                   help='Enable pixel CNN (slower, larger model)')
 
     # Policy
     p.add_argument('--hidden-size', type=int, default=256)
     p.add_argument('--embed-dim', type=int, default=16)
-    p.add_argument('--tile-channels', type=int, default=32)
-    p.add_argument('--npc-hidden', type=int, default=32)
 
     # Training
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--total-timesteps', type=int, default=100_000_000)
-    p.add_argument('--batch-size', type=int, default=None,
-                   help='Batch size (default: num_envs * bptt_horizon)')
-    p.add_argument('--bptt-horizon', type=int, default=32,
-                   help='BPTT unroll length')
-    p.add_argument('--minibatch-size', type=int, default=None,
-                   help='PPO minibatch size (default: batch_size)')
+    p.add_argument('--batch-size', type=int, default=None)
+    p.add_argument('--bptt-horizon', type=int, default=32)
+    p.add_argument('--minibatch-size', type=int, default=None)
     p.add_argument('--max-minibatch-size', type=int, default=32768)
     p.add_argument('--update-epochs', type=int, default=1)
     p.add_argument('--learning-rate', type=float, default=2.5e-4)
@@ -140,8 +234,6 @@ def parse_args():
     p.add_argument('--adam-beta1', type=float, default=0.9)
     p.add_argument('--adam-beta2', type=float, default=0.999)
     p.add_argument('--adam-eps', type=float, default=1e-5)
-
-    # V-Trace / prioritized experience
     p.add_argument('--vtrace-rho-clip', type=float, default=1.0)
     p.add_argument('--vtrace-c-clip', type=float, default=1.0)
     p.add_argument('--prio-alpha', type=float, default=0.8)
@@ -152,14 +244,18 @@ def parse_args():
     p.add_argument('--torch-deterministic', type=bool, default=True)
     p.add_argument('--cpu-offload', type=bool, default=False)
     p.add_argument('--precision', type=str, default='float32')
-    p.add_argument('--compile', action='store_true',
-                   help='torch.compile the policy')
+    p.add_argument('--compile', action='store_true')
     p.add_argument('--compile-mode', type=str, default='default')
-    p.add_argument('--use-rnn', action='store_true', default=True,
-                   help='Wrap policy with LSTM (default: on)')
+    p.add_argument('--use-rnn', action='store_true', default=True)
     p.add_argument('--no-rnn', dest='use_rnn', action='store_false')
     p.add_argument('--checkpoint-interval', type=int, default=200)
     p.add_argument('--data-dir', type=str, default='experiments')
+
+    # GIF recording
+    p.add_argument('--gif-interval', type=int, default=50,
+                   help='Epochs between GIF frame captures')
+    p.add_argument('--heatmap-print-interval', type=int, default=10,
+                   help='Epochs between heatmap progress prints')
 
     # Logging
     p.add_argument('--wandb', action='store_true')
@@ -167,14 +263,12 @@ def parse_args():
     p.add_argument('--wandb-group', type=str, default='debug')
 
     # Resume
-    p.add_argument('--load-model-path', type=str, default=None,
-                   help='Path to .pt checkpoint to resume from')
+    p.add_argument('--load-model-path', type=str, default=None)
 
     return p.parse_args()
 
 
 def make_config(args):
-    """Build the config dict that PuffeRL expects."""
     batch_size = args.batch_size or (args.num_envs * args.bptt_horizon)
     minibatch_size = args.minibatch_size or batch_size
 
@@ -221,12 +315,16 @@ def main():
     args = parse_args()
     os.makedirs(args.data_dir, exist_ok=True)
 
+    gif_dir = os.path.join(args.data_dir, 'gifs')
+    os.makedirs(gif_dir, exist_ok=True)
+
     if args.compile:
         ptxas = '/usr/local/cuda/bin/ptxas'
         if os.path.exists(ptxas):
             os.environ.setdefault('TRITON_PTXAS_PATH', ptxas)
 
-    # -- Environment --
+    # ── Environment ──
+    use_pixels_int = 1 if args.use_pixels else 0
     vecenv = pufferlib.vector.make(
         PFRNTraining,
         env_kwargs=dict(
@@ -235,17 +333,17 @@ def main():
             max_steps=args.max_steps,
             log_interval=args.log_interval,
             seed=args.seed,
+            use_pixels=use_pixels_int,
         ),
         backend=pufferlib.vector.PufferEnv,
     )
 
-    # -- Policy --
+    # ── Policy ──
     policy = PFRNPolicy(
         vecenv,
         hidden_size=args.hidden_size,
         embed_dim=args.embed_dim,
-        tile_channels=args.tile_channels,
-        npc_hidden=args.npc_hidden,
+        use_pixels=args.use_pixels,
     )
     if args.use_rnn:
         policy = PFRNLSTM(vecenv, policy,
@@ -253,14 +351,19 @@ def main():
                           hidden_size=args.hidden_size)
     policy = policy.to(args.device)
 
-    # -- Resume from checkpoint --
+    param_count = sum(p.numel() for p in policy.parameters())
+    mode = 'FULL (pixels+CNN)' if args.use_pixels else 'LITE (scalar+NPC+tiles)'
+    print(f'Policy: {mode}, {param_count/1e6:.1f}M params')
+
+    # ── Resume ──
     if args.load_model_path:
-        state_dict = torch.load(args.load_model_path, map_location=args.device)
+        state_dict = torch.load(args.load_model_path, map_location=args.device,
+                                weights_only=False)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         policy.load_state_dict(state_dict)
         print(f'Loaded checkpoint: {args.load_model_path}')
 
-    # -- Logger --
+    # ── Logger ──
     logger = None
     if args.wandb:
         wandb_args = {
@@ -272,15 +375,24 @@ def main():
         }
         logger = WandbLogger(wandb_args)
 
-    # -- Train --
+    # ── Train ──
     config = make_config(args)
     pufferl = PuffeRL(config, vecenv, policy, logger)
 
-    print(f'Training pokefirered_puffer: {args.num_envs} envs, '
+    print(f'Training: {args.num_envs} envs, '
           f'batch={config["batch_size"]}, '
           f'bptt={config["bptt_horizon"]}, '
           f'rnn={args.use_rnn}, '
           f'device={args.device}')
+    print(f'GIF recording: every {args.gif_interval} epochs')
+    print()
+
+    # ── GIF recording state ──
+    heatmap_frames = []
+    view_frames = []
+    last_heatmap_tiles = 0
+    epoch = 0
+    t0 = time.time()
 
     try:
         while pufferl.global_step < config['total_timesteps']:
@@ -290,12 +402,67 @@ def main():
             if config['device'] == 'cuda':
                 torch.compiler.cudagraph_mark_step_begin()
             pufferl.train()
+            epoch += 1
+
+            # ── Heatmap progress (primary metric) ──
+            heatmap = _shared.get('heatmap')
+            if heatmap is not None and epoch % args.heatmap_print_interval == 0:
+                tiles = int(np.count_nonzero(heatmap))
+                delta = tiles - last_heatmap_tiles
+                elapsed = time.time() - t0
+                sps = pufferl.global_step / max(elapsed, 0.001)
+                print(f'[epoch {epoch:5d} | step {pufferl.global_step:9d} | '
+                      f'{sps:.0f} SPS] '
+                      f'Heatmap: {tiles} tiles (+{delta})')
+                last_heatmap_tiles = tiles
+
+            # ── GIF frame capture ──
+            if epoch % args.gif_interval == 0:
+                if heatmap is not None:
+                    heatmap_frames.append(heatmap_to_rgb(heatmap))
+                try:
+                    frame = binding.capture_frame(0)
+                    view_frames.append(framebuf_to_rgb(frame))
+                except Exception:
+                    pass
+
+            # ── Save GIFs at checkpoints ──
+            if epoch % config['checkpoint_interval'] == 0:
+                if heatmap_frames:
+                    save_gif(heatmap_frames,
+                             os.path.join(gif_dir, 'heatmap.gif'), 150)
+                if view_frames:
+                    save_gif(view_frames,
+                             os.path.join(gif_dir, 'agent_view.gif'), 50)
+                if heatmap is not None:
+                    save_png(heatmap_to_rgb(heatmap),
+                             os.path.join(gif_dir, 'heatmap_latest.png'))
+
     except KeyboardInterrupt:
         print('\nTraining interrupted.')
 
+    # ── Final save ──
     model_path = pufferl.close()
     if logger:
         logger.close(model_path, early_stop=False)
+
+    # Save final GIFs
+    if heatmap_frames:
+        save_gif(heatmap_frames, os.path.join(gif_dir, 'heatmap_final.gif'), 150)
+        print(f'Heatmap GIF: {gif_dir}/heatmap_final.gif '
+              f'({len(heatmap_frames)} frames)')
+    if view_frames:
+        save_gif(view_frames, os.path.join(gif_dir, 'agent_view_final.gif'), 50)
+        print(f'Agent view GIF: {gif_dir}/agent_view_final.gif '
+              f'({len(view_frames)} frames)')
+
+    heatmap = _shared.get('heatmap')
+    if heatmap is not None:
+        tiles = int(np.count_nonzero(heatmap))
+        save_png(heatmap_to_rgb(heatmap),
+                 os.path.join(gif_dir, 'heatmap_final.png'))
+        print(f'Final heatmap: {tiles} unique tiles')
+
     print(f'Model saved: {model_path}')
 
 
