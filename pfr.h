@@ -167,6 +167,8 @@ typedef struct {
     uint16_t prev_party_level_sum;
     uint32_t prev_money;
 
+    uint64_t visited_maps;  /* bitfield: map-transition bonus */
+
     uint32_t step_count;
     float    episode_return;
 } PfrRewardState;
@@ -218,6 +220,10 @@ struct PfrEnv {
     uint32_t frames_per_step;
     char     savestate_path[512];
     uint8_t  use_pixels;             /* skip pfr_extract_pixels when 0 */
+
+    /* Global exploration (persists across episodes, NOT reset) */
+    uint32_t global_visit_hash[PFR_VISIT_HASH_SIZE / 32];
+    uint32_t global_visit_count;
 };
 
 /* ================================================================
@@ -240,7 +246,7 @@ static const uint16_t sPfrActionToButtons[PFR_NUM_ACTIONS] = {
     [4] = PFR_BTN_RIGHT,
     [5] = PFR_BTN_A,
     [6] = PFR_BTN_B,
-    [7] = PFR_BTN_START,
+    [7] = 0,              /* START disabled: prevents menu trap */
 };
 
 /* ================================================================
@@ -266,6 +272,19 @@ static bool pfr_visit_check_and_set(PfrRewardState *rs, uint8_t mg, uint8_t mn,
     return true;
 }
 
+/* Global visit tracking (persistent across episodes) */
+static bool pfr_global_visit_check_and_set(PfrEnv *env, uint8_t mg, uint8_t mn,
+                                            int16_t x, int16_t y) {
+    uint32_t idx = pfr_tile_hash(mg, mn, x, y);
+    uint32_t word = idx / 32;
+    uint32_t bit = 1u << (idx % 32);
+    if (env->global_visit_hash[word] & bit)
+        return false;
+    env->global_visit_hash[word] |= bit;
+    env->global_visit_count++;
+    return true;
+}
+
 /* ================================================================
  * Reward computation
  * ================================================================ */
@@ -278,26 +297,47 @@ static float pfr_compute_reward(PfrEnv *env, const PfrRewardInfo *info) {
     pfr_visit_check_and_set(rs, info->map_group, info->map_num,
                              info->player_x, info->player_y);
     uint32_t new_visits = rs->visit_count - rs->prev_visit_count;
-    reward += new_visits * 0.02f;
+    reward += new_visits * 0.01f;  /* per-episode: tiny revisit signal */
     rs->prev_visit_count = rs->visit_count;
+
+    /* 1a. Global frontier bonus (never-before-visited tile) */
+    if (new_visits > 0) {
+        bool globally_new = pfr_global_visit_check_and_set(
+            env, info->map_group, info->map_num,
+            info->player_x, info->player_y);
+        if (globally_new)
+            reward += 50.0f;  /* dominant signal: push the frontier */
+    }
+
+    /* 1b. Map transition bonus (first visit to each map per episode) */
+    {
+        uint32_t map_id = (uint32_t)info->map_group * 256 + info->map_num;
+        uint32_t map_bit_idx = (map_id * 7 + info->map_group) % 64;
+        uint64_t map_bit = 1ULL << map_bit_idx;
+        if (!(rs->visited_maps & map_bit)) {
+            if (rs->visited_maps != 0)   /* skip spawn map */
+                reward += 10.0f;  /* big milestone for new maps */
+            rs->visited_maps |= map_bit;
+        }
+    }
 
     /* 2. Badge progression */
     uint8_t new_badges = info->badges & ~rs->prev_badges;
     if (new_badges) {
         int count = __builtin_popcount(new_badges);
-        reward += count * 10.0f;
+        reward += count * 50.0f;
         rs->prev_badges = info->badges;
     }
 
     /* 3. Party level gains */
     if (info->party_level_sum > rs->prev_party_level_sum) {
-        reward += (info->party_level_sum - rs->prev_party_level_sum) * 0.1f;
+        reward += (info->party_level_sum - rs->prev_party_level_sum) * 2.0f;
         rs->prev_party_level_sum = info->party_level_sum;
     }
 
     /* 4. New party member */
     if (info->party_count > rs->prev_party_count) {
-        reward += (info->party_count - rs->prev_party_count) * 1.0f;
+        reward += (info->party_count - rs->prev_party_count) * 5.0f;
         rs->prev_party_count = info->party_count;
     }
 
@@ -430,6 +470,13 @@ static void c_step(PfrEnv *env) {
 
     /* 1. Map action to GBA buttons */
     uint16_t buttons = sPfrActionToButtons[action];
+
+    /* AUTO-BATTLE: if in battle, force A-button every step.
+     * Lite mode has no pixel obs, so agent can't see battle menus.
+     * A-button selects FIGHT -> first move -> confirms text boxes. */
+    if (env->observations[11]) {  /* in_battle from previous obs */
+        buttons = PFR_BTN_A;
+    }
 
     /* 2. Step game frames
      * Uses step_frames (not step_frames_fast) because the menu system
