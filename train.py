@@ -79,15 +79,22 @@ def local_to_global(y, x, map_group, map_num, regions, pad):
 
 # ── GIF utilities ──────────────────────────────────────────────
 
-def heatmap_to_rgb(heatmap):
-    if heatmap.max() > 0:
-        norm = (heatmap / heatmap.max() * 255).astype(np.uint8)
-    else:
-        norm = np.zeros_like(heatmap, dtype=np.uint8)
+def heatmap_to_rgb(heatmap, scale=4, pad=10):
+    """Crop heatmap to visited area, colorize, and scale up for visibility."""
+    mask = heatmap > 0
+    if not mask.any():
+        return np.zeros((64, 64, 3), dtype=np.uint8)
+    ys, xs = np.where(mask)
+    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, heatmap.shape[0])
+    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, heatmap.shape[1])
+    crop = heatmap[y0:y1, x0:x1]
+    norm = (crop / crop.max() * 255).astype(np.uint8) if crop.max() > 0 else crop.astype(np.uint8)
     h, w = norm.shape
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    rgb[..., 1] = norm
-    rgb[..., 2] = (norm.astype(np.float32) * 0.3).astype(np.uint8)
+    rgb[..., 1] = norm  # green channel = visit intensity
+    rgb[..., 2] = (norm.astype(np.float32) * 0.3).astype(np.uint8)  # slight blue
+    # Scale up for visibility
+    rgb = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     return rgb
 
 
