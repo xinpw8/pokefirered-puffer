@@ -295,16 +295,24 @@ static bool pfr_visit_check_and_set(PfrRewardState *rs, uint8_t mg, uint8_t mn,
     return was_new;
 }
 
-/* Global visit tracking (persistent across episodes) */
+/* Shared global exploration hash (all envs in this process share one hash).
+ * Since PufferLib runs all envs sequentially (no threading), this is safe.
+ * Only the first env to reach a tile gets the frontier bonus (+50),
+ * creating pressure for envs to explore different areas. */
+static uint32_t s_shared_global_hash[PFR_REWARD_HASH_WORDS];
+static uint32_t s_shared_global_count;
+
+/* Global visit tracking (shared across all envs in process) */
 static bool pfr_global_visit_check_and_set(PfrEnv *env, uint8_t mg, uint8_t mn,
                                             int16_t x, int16_t y) {
+    (void)env;  /* uses process-wide shared hash, not per-env */
     uint32_t idx = pfr_tile_hash(mg, mn, x, y, PFR_REWARD_HASH_SIZE);
     uint32_t word = idx / 32;
     uint32_t bit = 1u << (idx % 32);
-    if (env->global_visit_hash[word] & bit)
+    if (s_shared_global_hash[word] & bit)
         return false;
-    env->global_visit_hash[word] |= bit;
-    env->global_visit_count++;
+    s_shared_global_hash[word] |= bit;
+    s_shared_global_count++;
     return true;
 }
 
@@ -320,7 +328,7 @@ static float pfr_compute_reward(PfrEnv *env, const PfrRewardInfo *info) {
     pfr_visit_check_and_set(rs, info->map_group, info->map_num,
                              info->player_x, info->player_y);
     uint32_t new_visits = rs->visit_count - rs->prev_visit_count;
-    reward += new_visits * 0.01f;  /* per-episode: tiny revisit signal */
+    reward += new_visits * 0.5f;   /* per-episode: strong local exploration signal */
     rs->prev_visit_count = rs->visit_count;
 
     /* 1a. Global frontier bonus (never-before-visited tile) */

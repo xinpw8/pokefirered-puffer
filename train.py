@@ -79,8 +79,8 @@ def local_to_global(y, x, map_group, map_num, regions, pad):
 
 # ── GIF utilities ──────────────────────────────────────────────
 
-def heatmap_to_rgb(heatmap, scale=4, pad=10):
-    """Crop heatmap to visited area, colorize, and scale up for visibility."""
+def heatmap_to_rgb(heatmap, scale=3, pad=5):
+    """Crop heatmap to visited area, colorize binary, and scale up."""
     mask = heatmap > 0
     if not mask.any():
         return np.zeros((64, 64, 3), dtype=np.uint8)
@@ -88,12 +88,18 @@ def heatmap_to_rgb(heatmap, scale=4, pad=10):
     y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, heatmap.shape[0])
     x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, heatmap.shape[1])
     crop = heatmap[y0:y1, x0:x1]
-    norm = (crop / crop.max() * 255).astype(np.uint8) if crop.max() > 0 else crop.astype(np.uint8)
+    # Log-scale: makes low-count tiles visible, high-count tiles brighter
+    log_map = np.where(crop > 0, np.log1p(crop), 0)
+    norm = (log_map / max(log_map.max(), 1) * 200 + 55).astype(np.uint8)
+    norm[crop == 0] = 0
     h, w = norm.shape
-    rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    rgb[..., 1] = norm  # green channel = visit intensity
-    rgb[..., 2] = (norm.astype(np.float32) * 0.3).astype(np.uint8)  # slight blue
-    # Scale up for visibility
+    # Dark gray background (10) so unvisited areas are distinguishable
+    rgb = np.full((h, w, 3), 10, dtype=np.uint8)
+    rgb[crop > 0, 0] = 0   # no red for visited
+    rgb[crop > 0, 1] = norm[crop > 0]  # green = log visit count
+    rgb[crop > 0, 2] = 30  # slight blue tint for visited
+    rgb[crop == 0] = 10  # dark gray background
+    # Scale up
     rgb = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
     return rgb
 
