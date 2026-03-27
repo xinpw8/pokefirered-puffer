@@ -433,6 +433,13 @@ static void pfr_restore_episode(PfrEnv *env, bool clear_outputs) {
         inst->restore_hot();
     }
 
+    /* Per-episode spawn randomization: warp to a random position
+     * to ensure continuous exploration across the full map area.
+     * Each episode starts at a different location. */
+    if (inst->randomize_spawn) {
+        inst->randomize_spawn();
+    }
+
     /* 3. Snapshot baseline for delta reward */
     PfrRewardInfo info;
     inst->get_reward_info(&info);
