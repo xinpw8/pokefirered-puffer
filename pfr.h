@@ -64,6 +64,12 @@
 #define PFR_VISIT_HASH_SIZE   1024
 #define PFR_VISIT_BYTES       (PFR_VISIT_HASH_SIZE / 8)  /* 128 */
 
+/* Reward tracking uses much larger hash to avoid collision-induced plateau.
+ * With 1024-bit hash, ~1400 tiles saturate it (birthday problem).
+ * 65536 bits supports ~40K tiles before 25% collision rate. */
+#define PFR_REWARD_HASH_SIZE  65536
+#define PFR_REWARD_HASH_WORDS (PFR_REWARD_HASH_SIZE / 32)  /* 2048 */
+
 /* ================================================================
  * Observation structs (packed, little-endian)
  *
@@ -158,7 +164,8 @@ typedef struct __attribute__((packed)) {
  * ================================================================ */
 
 typedef struct {
-    uint32_t visit_hash[PFR_VISIT_HASH_SIZE / 32];
+    uint32_t visit_hash[PFR_REWARD_HASH_WORDS];       /* 65536-bit per-episode reward hash */
+    uint32_t visit_hash_obs[PFR_VISIT_HASH_SIZE / 32]; /* 1024-bit obs bitfield (small, for policy) */
     uint32_t visit_count;
     uint32_t prev_visit_count;
 
@@ -222,8 +229,14 @@ struct PfrEnv {
     uint8_t  use_pixels;             /* skip pfr_extract_pixels when 0 */
 
     /* Global exploration (persists across episodes, NOT reset) */
-    uint32_t global_visit_hash[PFR_VISIT_HASH_SIZE / 32];
+    uint32_t global_visit_hash[PFR_REWARD_HASH_WORDS];  /* 65536-bit global hash */
     uint32_t global_visit_count;
+
+    /* Stuck-detection: auto-press B to escape dialogue/menus
+     * (must be at END of struct to avoid disrupting PufferLib layout) */
+    int16_t  prev_step_x;
+    int16_t  prev_step_y;
+    uint16_t stuck_steps;
 };
 
 /* ================================================================
@@ -244,7 +257,7 @@ static const uint16_t sPfrActionToButtons[PFR_NUM_ACTIONS] = {
     [2] = PFR_BTN_DOWN,
     [3] = PFR_BTN_LEFT,
     [4] = PFR_BTN_RIGHT,
-    [5] = PFR_BTN_A,
+    [5] = 0,  /* A disabled in overworld (auto-battle handles it) */
     [6] = PFR_BTN_B,
     [7] = 0,              /* START disabled: prevents menu trap */
 };
@@ -253,29 +266,39 @@ static const uint16_t sPfrActionToButtons[PFR_NUM_ACTIONS] = {
  * Exploration hash
  * ================================================================ */
 
-static uint32_t pfr_tile_hash(uint8_t mg, uint8_t mn, int16_t x, int16_t y) {
+static uint32_t pfr_tile_hash(uint8_t mg, uint8_t mn, int16_t x, int16_t y,
+                             uint32_t mod) {
     uint32_t h = (uint32_t)mg * 31 + (uint32_t)mn;
     h = h * 2654435761u + (uint32_t)(uint16_t)x;
     h = h * 2654435761u + (uint32_t)(uint16_t)y;
-    return h % PFR_VISIT_HASH_SIZE;
+    return h % mod;
 }
 
 static bool pfr_visit_check_and_set(PfrRewardState *rs, uint8_t mg, uint8_t mn,
                                      int16_t x, int16_t y) {
-    uint32_t idx = pfr_tile_hash(mg, mn, x, y);
+    /* Large hash (65536-bit) for accurate reward tracking */
+    uint32_t idx = pfr_tile_hash(mg, mn, x, y, PFR_REWARD_HASH_SIZE);
     uint32_t word = idx / 32;
     uint32_t bit = 1u << (idx % 32);
-    if (rs->visit_hash[word] & bit)
-        return false;
-    rs->visit_hash[word] |= bit;
-    rs->visit_count++;
-    return true;
+    bool was_new = !(rs->visit_hash[word] & bit);
+    if (was_new) {
+        rs->visit_hash[word] |= bit;
+        rs->visit_count++;
+    }
+
+    /* Small hash (1024-bit) for observation bitfield */
+    uint32_t obs_idx = pfr_tile_hash(mg, mn, x, y, PFR_VISIT_HASH_SIZE);
+    uint32_t obs_word = obs_idx / 32;
+    uint32_t obs_bit = 1u << (obs_idx % 32);
+    rs->visit_hash_obs[obs_word] |= obs_bit;
+
+    return was_new;
 }
 
 /* Global visit tracking (persistent across episodes) */
 static bool pfr_global_visit_check_and_set(PfrEnv *env, uint8_t mg, uint8_t mn,
                                             int16_t x, int16_t y) {
-    uint32_t idx = pfr_tile_hash(mg, mn, x, y);
+    uint32_t idx = pfr_tile_hash(mg, mn, x, y, PFR_REWARD_HASH_SIZE);
     uint32_t word = idx / 32;
     uint32_t bit = 1u << (idx % 32);
     if (env->global_visit_hash[word] & bit)
@@ -355,7 +378,7 @@ static float pfr_compute_reward(PfrEnv *env, const PfrRewardInfo *info) {
 
 static void pfr_extract_visited_tiles(PfrEnv *env) {
     memcpy(env->observations + PFR_OFF_VISITED,
-           env->reward_state.visit_hash,
+           env->reward_state.visit_hash_obs,
            PFR_VISIT_BYTES);
 }
 
@@ -424,6 +447,11 @@ static void pfr_restore_episode(PfrEnv *env, bool clear_outputs) {
     rs->prev_party_level_sum = info.party_level_sum;
     rs->prev_money = info.money;
 
+    /* Reset stuck detection */
+    env->stuck_steps = 0;
+    env->prev_step_x = info.player_x;
+    env->prev_step_y = info.player_y;
+
     /* Mark starting tile visited */
     pfr_visit_check_and_set(rs, info.map_group, info.map_num,
                              info.player_x, info.player_y);
@@ -476,6 +504,26 @@ static void c_step(PfrEnv *env) {
      * A-button selects FIGHT -> first move -> confirms text boxes. */
     if (env->observations[11]) {  /* in_battle from previous obs */
         buttons = PFR_BTN_A;
+    }
+
+    /* AUTO-DISMISS dialogue: if position unchanged for 8+ steps,
+     * agent is likely stuck in a text box or menu. Press B to close.
+     * Normal walking takes 2-4 steps per tile, so 8 avoids false positives.
+     * After firing, reset counter so we don't permanently override. */
+    {
+        int16_t cur_x = (int16_t)(env->observations[0] | (env->observations[1] << 8));
+        int16_t cur_y = (int16_t)(env->observations[2] | (env->observations[3] << 8));
+        if (cur_x == env->prev_step_x && cur_y == env->prev_step_y)
+            env->stuck_steps++;
+        else
+            env->stuck_steps = 0;
+        env->prev_step_x = cur_x;
+        env->prev_step_y = cur_y;
+
+        if (env->stuck_steps >= 8) {
+            buttons = PFR_BTN_B;   /* force B to dismiss text/menus */
+            env->stuck_steps = 0;  /* reset so agent can try moving next */
+        }
     }
 
     /* 2. Step game frames
