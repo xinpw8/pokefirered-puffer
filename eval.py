@@ -36,7 +36,7 @@ if os.path.isdir(PUFFERLIB_DIR) and PUFFERLIB_DIR not in sys.path:
     sys.path.insert(1, PUFFERLIB_DIR)
 
 import binding
-from pfr_policy import PFRNPolicy, PFRNLSTM, OBS_SIZE, NUM_ACTIONS
+from pfr_policy import PFRNPolicy, PFRNLSTM, OBS_SIZE, LITE_OBS_SIZE, NUM_ACTIONS
 
 # Obs layout (from pfr.h)
 VISIT_START = 145
@@ -157,13 +157,13 @@ def make_policy(args, device):
     policy.eval()
     print(f'Loaded checkpoint: {args.checkpoint}')
 
-    # LSTM hidden state
+    # LSTM hidden state (dict for pufferlib LSTMWrapper)
     rnn_state = None
     if args.use_rnn:
-        rnn_state = (
-            torch.zeros(1, args.num_envs, args.hidden_size, device=device),
-            torch.zeros(1, args.num_envs, args.hidden_size, device=device),
-        )
+        rnn_state = {
+            "lstm_h": torch.zeros(args.num_envs, args.hidden_size, device=device),
+            "lstm_c": torch.zeros(args.num_envs, args.hidden_size, device=device),
+        }
 
     return policy, rnn_state
 
@@ -223,10 +223,10 @@ def run_eval(args):
         if policy:
             import torch
             with torch.no_grad():
-                obs_t = torch.from_numpy(obs_buf.copy()).to(device)
+                obs_t = torch.from_numpy(obs_buf.copy()).float().to(device)
                 if rnn_state is not None:
-                    out = policy(obs_t, rnn_state)
-                    logits, value, rnn_state = out[0], out[1], out[2]
+                    logits, value = policy.forward_eval(obs_t, rnn_state)
+                    # rnn_state dict is updated in-place by forward_eval
                 else:
                     logits, value = policy(obs_t)
                 actions = torch.argmax(logits, dim=-1).cpu().numpy()
@@ -286,8 +286,8 @@ def run_eval(args):
 
                 # Reset LSTM state for this env
                 if rnn_state is not None:
-                    rnn_state[0][:, i, :] = 0
-                    rnn_state[1][:, i, :] = 0
+                    rnn_state["lstm_h"][i] = 0
+                    rnn_state["lstm_c"][i] = 0
 
                 env_returns[i] = 0.0
                 env_steps[i] = 0
