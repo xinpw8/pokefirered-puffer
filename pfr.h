@@ -51,7 +51,7 @@
 #define PFR_NUM_BADGES        8
 #define PFR_NUM_ACTIONS       8
 
-#define PFR_FRAMES_PER_STEP   4
+#define PFR_FRAMES_PER_STEP   8
 #define PFR_MAX_STEPS         24576
 
 /* Screen dimensions (GBA native) */
@@ -253,10 +253,10 @@ struct PfrEnv {
 
 static const uint16_t sPfrActionToButtons[PFR_NUM_ACTIONS] = {
     [0] = 0,              /* noop */
-    [1] = PFR_BTN_UP,
-    [2] = PFR_BTN_DOWN,
-    [3] = PFR_BTN_LEFT,
-    [4] = PFR_BTN_RIGHT,
+    [1] = PFR_BTN_UP | PFR_BTN_B,     /* up + auto-run */
+    [2] = PFR_BTN_DOWN | PFR_BTN_B,   /* down + auto-run */
+    [3] = PFR_BTN_LEFT | PFR_BTN_B,   /* left + auto-run */
+    [4] = PFR_BTN_RIGHT | PFR_BTN_B,  /* right + auto-run */
     [5] = 0,  /* A disabled in overworld (auto-battle handles it) */
     [6] = PFR_BTN_B,
     [7] = 0,              /* START disabled: prevents menu trap */
