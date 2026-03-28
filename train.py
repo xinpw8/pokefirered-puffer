@@ -46,7 +46,7 @@ import pufferlib.pytorch
 from pufferlib.pufferl import PuffeRL, WandbLogger, NoLogger
 
 import binding
-from pfr_policy import PFRNPolicy, PFRNLSTM, OBS_SIZE, NUM_ACTIONS
+from pfr_policy import PFRNPolicy, PFRNLSTM, OBS_SIZE, LITE_OBS_SIZE, NUM_ACTIONS
 
 # Map data for heatmap
 MAP_DATA_PATH = os.path.join(PFRN_DIR, 'pfr_map_data.json')
@@ -123,6 +123,20 @@ def save_png(rgb, path):
     Image.fromarray(rgb).save(path)
 
 
+MAX_GIF_FRAMES = 300  # cap to avoid OOM on long runs
+
+
+def thin_frames(frames):
+    """Keep every other frame when list exceeds MAX_GIF_FRAMES.
+    Preserves first and last frame so GIF shows full progression."""
+    if len(frames) <= MAX_GIF_FRAMES:
+        return frames
+    thinned = frames[::2]
+    if thinned[-1] is not frames[-1]:
+        thinned.append(frames[-1])
+    return thinned
+
+
 # ── Training Environment ──────────────────────────────────────
 
 class PFRNTraining(pufferlib.PufferEnv):
@@ -136,8 +150,9 @@ class PFRNTraining(pufferlib.PufferEnv):
                  log_interval=128, seed=0, use_pixels=0, **kwargs):
         import gymnasium
         self.num_agents = num_envs
+        obs_size = OBS_SIZE if use_pixels else LITE_OBS_SIZE
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(OBS_SIZE,), dtype=np.uint8)
+            low=0, high=255, shape=(obs_size,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.Discrete(NUM_ACTIONS)
         super().__init__()
 
@@ -433,9 +448,13 @@ def main():
             if epoch % args.gif_interval == 0:
                 if heatmap is not None:
                     heatmap_frames.append(heatmap_to_rgb(heatmap))
+                    if len(heatmap_frames) > MAX_GIF_FRAMES:
+                        heatmap_frames = thin_frames(heatmap_frames)
                 try:
                     frame = binding.capture_frame(0)
                     view_frames.append(framebuf_to_rgb(frame))
+                    if len(view_frames) > MAX_GIF_FRAMES:
+                        view_frames = thin_frames(view_frames)
                 except Exception:
                     pass
 
