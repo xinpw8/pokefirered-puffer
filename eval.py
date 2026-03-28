@@ -223,13 +223,22 @@ def run_eval(args):
         if policy:
             import torch
             with torch.no_grad():
-                obs_t = torch.from_numpy(obs_buf.copy()).float().to(device)
+                obs_t = torch.from_numpy(obs_buf.copy()).to(device)
                 if rnn_state is not None:
                     logits, value = policy.forward_eval(obs_t, rnn_state)
                     # rnn_state dict is updated in-place by forward_eval
                 else:
                     logits, value = policy(obs_t)
-                actions = torch.argmax(logits, dim=-1).cpu().numpy()
+                # Sample from distribution (matching training behavior)
+                dist = torch.distributions.Categorical(logits=logits)
+                actions = dist.sample().cpu().numpy()
+                # Log action distribution periodically
+                if total_steps % 1000 == 0:
+                    probs = torch.softmax(logits[0], dim=-1).cpu().numpy()
+                    action_names = ["NOOP","UP","DOWN","LEFT","RIGHT","A","B","START"]
+                    top3 = sorted(zip(action_names, probs), key=lambda x: -x[1])[:3]
+                    top3_str = "  ".join(f"{n}:{p:.2f}" for n, p in top3)
+                    print(f"    [actions] {top3_str}")
         else:
             actions = np.random.randint(0, NUM_ACTIONS, num_envs)
 
